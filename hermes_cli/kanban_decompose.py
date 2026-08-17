@@ -324,7 +324,7 @@ def decompose_task(
             ],
             temperature=0.3,
             max_tokens=4000,
-            timeout=timeout or 180,
+            timeout=timeout,
         )
     except Exception as exc:
         logger.info(

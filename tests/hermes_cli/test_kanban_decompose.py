@@ -161,3 +161,41 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_decompose_timeout_passthrough(kanban_home):
+    """decompose_task must forward its timeout to call_llm unchanged.
+
+    The gateway auto-decompose path calls decompose_task() with NO timeout
+    arg, so call_llm must receive timeout=None to let _effective_aux_timeout()
+    resolve auxiliary.kanban_decomposer.timeout from config. A hardcoded
+    ``timeout or 180`` here would always override the config value and leave
+    tasks stuck in triage on slow backends (#88519).
+    """
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "timeout passthrough",
+        "tasks": [{"title": "child", "body": "b", "assignee": "orchestrator", "parents": []}],
+    })
+
+    def _run(timeout_arg):
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="t", triage=True)
+        patches = _patch_list_profiles(["orchestrator"])
+        for p in patches:
+            p.start()
+        try:
+            with _patch_aux_client(llm_payload) as mock_call_llm, _patch_extra_body():
+                outcome = decomp.decompose_task(tid, author="me", timeout=timeout_arg)
+        finally:
+            for p in patches:
+                p.stop()
+        assert outcome.ok, outcome.reason
+        return mock_call_llm
+
+    # Gateway auto-decompose path: no timeout arg -> call_llm must see None
+    # so the config value (auxiliary.kanban_decomposer.timeout) can apply.
+    mock_no_arg = _run(None)
+    assert mock_no_arg.call_args.kwargs.get("timeout") is None
+
+    # Explicit timeout arg must be passed through unchanged (explicit wins).
+    mock_explicit = _run(42)
+    assert mock_explicit.call_args.kwargs.get("timeout") == 42
