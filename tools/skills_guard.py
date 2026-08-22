@@ -573,6 +573,95 @@ INVISIBLE_CHARS = {
 # Scanning functions
 # ---------------------------------------------------------------------------
 
+# Path-token patterns whose severity is only meaningful when the token is used
+# in an actual read/write/exec action. When the token is merely *named* — in a
+# comment, or inside a skill's own denylist (a skip/ignore/deny/exclude list
+# stating the paths the skill refuses to touch) — the finding is demoted to
+# informational rather than blocking the install (#92478).
+_DEMOTABLE_PATH_PATTERN_IDS = frozenset({
+    "ssh_backdoor",
+    "aws_dir_access",
+    "ssh_dir_access",
+    "gpg_dir_access",
+    "kube_dir_access",
+    "docker_dir_access",
+})
+
+# A variable whose name carries a deny/skip/ignore/exclude/block/refuse word is
+# the standard way a skill spells out the paths it refuses to touch:
+#     SKIP = re.compile(r"|authorized_keys")
+#     IGNORED = ["~/.aws", "~/.ssh"]
+# Match an assignment/list to such a named variable and capture the name.
+_DENYLIST_ASSIGN_RE = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*[=:]",
+    re.IGNORECASE,
+)
+_DENYLIST_NAME_RE = re.compile(
+    r"(deny|denylist|skip|skip[_-]?list|ignore|ignored|exclude|excludes|"
+    r"block|blocks|refuse|refuses|avoid|avoids)",
+    re.IGNORECASE,
+)
+
+# The ONLY value we treat as provably inert data is a regex statement assigned
+# to a deny-named variable whose FIRST argument is a string literal:
+#     SKIP = re.compile(r"|authorized_keys")
+#     SKIP = re.search("authorized_keys", text)
+# Compiling a regex never executes a command, and a string-literal first
+# argument is pure data — the call is inert. We anchor on the ASSIGNMENT (the
+# value immediately after `=`) so a trailing comment or an in-argument
+# `re.compile(` on a real command line does not demote a genuine action; we
+# require the assignment to be the whole statement (a `;`-joined command such
+# as ``SKIP = re.compile(r"x"); cat ~/.ssh`` is a real action); and we require
+# the FIRST token of the argument to be a quoted string literal with no runtime
+# interpolation, and any further arguments to be plain identifiers/attribute
+# names only (no call parens). An f-string or `{}`-containing argument executes
+# code and an expression argument (``re.compile(open(x).read())``,
+# ``re.compile(subprocess.run(...))``, ``re.compile("x", os.system(...))``) is
+# evaluated at runtime, so neither is ever demoted. Real runtime calls always
+# need `(`, so forbidding `(` inside the argument list is a structural (not
+# allowlist) guarantee.
+# We do NOT attempt to demote bare strings, containers, or any other value
+# shape: a string or list can hold a command and discriminating "data" from
+# "command" there is exactly the whack-a-mole class of bypass every reviewer
+# keeps finding. Only a deny-named assignment whose first argument is a string
+# literal, and comments, are guaranteed inert.
+_DENYLIST_REGEX_RE = re.compile(
+    r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*[=:]\s*"
+    r"re\.\s*(?:compile|search|match|findall|finditer|fullmatch)\s*\("
+    r"\s*(?:rb|br|r|b|u)?"
+    r"[\"'][^\"'{}]*[\"']"
+    r"(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*\s*)*"
+    r"\)\s*$",
+    re.IGNORECASE,
+)
+
+_COMMENT_RE = re.compile(r"^\s*#")
+
+
+def _is_benign_path_reference(line: str, _match: "re.Match | None") -> bool:
+    """Decide whether a matched path token is a benign mention, not an action.
+
+    A mention is demoted to informational ONLY when it is provably inert:
+      (a) the line is a full-line comment (e.g. ``# ... ~/.aws/credentials``), or
+      (b) the line is an assignment to a deny/skip/ignore/block-named variable
+          whose value is a regex statement (e.g. ``SKIP = re.compile(...)``).
+          Compiling a regex never runs a command.
+
+    Every other shape keeps full severity. We do NOT demote containers, bare
+    strings, or any value that could be (or contain) a command — a finite
+    allowlist of verbs or exec-calls is always bypassable
+    (``SKIP = "less x"``, ``SKIP = [\"base64 y\"]``, ``SKIP = open(x).read()``,
+    ``SKIP = shutil.copy(x, y)``). Those stay critical/high.
+    """
+    if _COMMENT_RE.match(line):
+        return True
+    m = _DENYLIST_ASSIGN_RE.match(line)
+    if not m or not _DENYLIST_NAME_RE.search(m.group(1)):
+        return False
+    # Only a regex statement value is demoted. No other value shape is.
+    return bool(_DENYLIST_REGEX_RE.search(line))
+
+
 def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     """
     Scan a single file for threat patterns and invisible unicode characters.
@@ -609,9 +698,18 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
                 matched_text = line.strip()
                 if len(matched_text) > 120:
                     matched_text = matched_text[:117] + "..."
+                finding_severity = severity
+                # A bare path-token mention (comment or string/regex literal
+                # with no read/write/exec verb) is informational, not an action.
+                # This keeps a skill's own secret denylist from being treated as
+                # an exfil/persistence attempt (#92478).
+                if pid in _DEMOTABLE_PATH_PATTERN_IDS:
+                    m = pattern.search(line)
+                    if _is_benign_path_reference(line, m):
+                        finding_severity = "low"
                 findings.append(Finding(
                     pattern_id=pid,
-                    severity=severity,
+                    severity=finding_severity,
                     category=category,
                     file=rel_path,
                     line=i,

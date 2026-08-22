@@ -413,6 +413,285 @@ class TestFalsePositiveReductions:
         assert sec
         assert all(fi.severity == "critical" for fi in sec)
 
+    def test_denylist_spelling_out_secrets_is_not_dangerous(self, tmp_path):
+        # A skill that *refuses* to touch secrets spells out the paths in its
+        # own denylist: a regex literal `r"|authorized_keys"` and a comment
+        # naming `~/.aws/credentials`. It must NOT be scored as a critical
+        # ssh_backdoor / high aws_dir_access, and must not flip the verdict
+        # to dangerous (#92478).
+        skill_dir = tmp_path / "safer-skill"
+        scripts = skill_dir / "scripts"
+        scripts.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Safer Skill\nRefuses to read secrets.\n")
+        (scripts / "compress.py").write_text(
+            "# never touch ~/.aws/credentials, ~/.gnupg, or ~/.ssh\n"
+            'SKIP = re.compile(r"|authorized_keys")\n'
+            "results = []\n"
+        )
+
+        findings = scan_file(scripts / "compress.py", "scripts/compress.py")
+
+        # The denylist mention is informational (low), never critical/high.
+        bb = [fi for fi in findings if fi.pattern_id == "ssh_backdoor"]
+        if bb:
+            assert all(fi.severity == "low" for fi in bb), (
+                "denylist regex literal must not be a critical ssh_backdoor"
+            )
+        aws = [fi for fi in findings if fi.pattern_id == "aws_dir_access"]
+        if aws:
+            assert all(fi.severity == "low" for fi in aws), (
+                "denylist comment must not be a high aws_dir_access"
+            )
+
+        result = scan_skill(skill_dir, source="community")
+        assert result.verdict != "dangerous"
+        # Any surviving path-token finding stays informational.
+        for fi in result.findings:
+            if fi.pattern_id in (
+                "ssh_backdoor",
+                "aws_dir_access",
+                "ssh_dir_access",
+                "gpg_dir_access",
+                "kube_dir_access",
+                "docker_dir_access",
+            ):
+                assert fi.severity == "low", fi
+
+    def test_real_secret_actions_stay_critical(self, tmp_path):
+        # Genuine actions must keep full severity — the demotion must not
+        # over-relax and mask real exfiltration/persistence.
+        f = tmp_path / "evil.sh"
+        f.write_text(
+            "cat ~/.ssh/authorized_keys\n"          # real read -> critical
+            'echo "evil" >> ~/.aws/credentials\n'    # real write -> high
+            "scp -i ~/.aws/credentials data x\n"     # real scp -> high
+        )
+        findings = scan_file(f, "evil.sh")
+
+        sb = [fi for fi in findings if fi.pattern_id == "ssh_backdoor"]
+        assert sb and all(fi.severity == "critical" for fi in sb), (
+            "cat ~/.ssh/authorized_keys must stay a critical ssh_backdoor"
+        )
+        aws = [fi for fi in findings if fi.pattern_id == "aws_dir_access"]
+        assert aws and all(fi.severity == "high" for fi in aws), (
+            "echo >> ~/.aws/credentials must stay a high aws_dir_access"
+        )
+
+    def test_bare_reference_stays_flagged_denylist_demoted(self, tmp_path):
+        # A bare path mention with no deny/skip/ignore/refuse context is NOT
+        # benign — it could be an exfil action we don't recognise (base64,
+        # strings, read_bytes, ...), so it keeps full severity. Only a line that
+        # is a comment or clearly a skip/deny/ignore list is demoted (#92478).
+        f = tmp_path / "both.py"
+        f.write_text(
+            'DIRS = ["~/.aws", "~/.ssh"]\n'        # bare ref, no denylist hint -> high
+            "SKIP = re.compile(r\"|authorized_keys\")\n"  # denylist entry -> low
+        )
+        findings = scan_file(f, "both.py")
+
+        aws_lines = {
+            fi.line: fi.severity for fi in findings if fi.pattern_id == "aws_dir_access"
+        }
+        assert aws_lines[1] == "high", (
+            "a bare path mention must stay high, not demote by absent verb"
+        )
+        bb_lines = {
+            fi.line: fi.severity for fi in findings if fi.pattern_id == "ssh_backdoor"
+        }
+        assert bb_lines[2] == "low", (
+            "an explicit denylist entry naming the path is informational"
+        )
+
+    def test_unknown_exfil_verbs_stay_high(self, tmp_path):
+        # Reviewer finding: exfil verbs NOT in any allowlist (base64, strings,
+        # read_bytes, tar, grep) must stay high — the fix must never demote on
+        # the absence of a recognised verb. This guards the security posture.
+        f = tmp_path / "evasion.sh"
+        f.write_text(
+            "base64 ~/.aws/credentials\n"
+            "strings ~/.ssh/authorized_keys\n"
+            'read_bytes("~/.aws/credentials")\n'
+            "tar cf /tmp/x ~/.aws/\n"
+            "grep -r key ~/.ssh/authorized_keys\n"
+        )
+        findings = scan_file(f, "evasion.sh")
+        for pattern_id in ("aws_dir_access", "ssh_dir_access", "ssh_backdoor"):
+            flagged = [
+                fi for fi in findings
+                if fi.pattern_id == pattern_id and fi.severity in ("critical", "high")
+            ]
+            assert flagged, f"{pattern_id} must stay critical/high for exfil actions"
+
+    def test_denylist_word_in_comment_cannot_mask_real_action(self, tmp_path):
+        # Reviewer finding: a deny/skip word appearing anywhere on a line must
+        # not rescue a real action — `cat ~/.ssh/authorized_keys # skip` is
+        # still exfiltration. Only a deny-NAMED variable assignment holding
+        # data (regex / container literal) or a full-line comment is benign.
+        f = tmp_path / "spoof.sh"
+        f.write_text(
+            "cat ~/.ssh/authorized_keys  # skip\n"
+            "base64 ~/.aws/credentials   # denylist\n"
+            "tar cf /tmp/x ~/.aws/       # exclude\n"
+        )
+        findings = scan_file(f, "spoof.sh")
+
+        bb = [fi for fi in findings if fi.pattern_id == "ssh_backdoor"]
+        assert bb and all(fi.severity == "critical" for fi in bb), (
+            "cat ~/.ssh/authorized_keys must stay critical even with # skip"
+        )
+        aws = [fi for fi in findings if fi.pattern_id == "aws_dir_access"]
+        assert aws and all(fi.severity == "high" for fi in aws), (
+            "real actions must stay high even with a deny word in a comment"
+        )
+
+    def test_deny_named_var_must_hold_data_not_a_command(self, tmp_path):
+        # Reviewer finding: a deny-named variable whose VALUE is a command string
+        # or an exec/subprocess call is a real action, not a benign denylist —
+        # it must stay flagged (a finite verb allowlist would be bypassed by
+        # `SKIP = "less ~/.ssh/authorized_keys"`).
+        f = tmp_path / "trick.py"
+        f.write_text(
+            'SKIP = "less ~/.ssh/authorized_keys"\n'
+            'SKIP_LIST = subprocess.run(["tee", "~/.aws/credentials"])\n'
+            'SKIP2 = "cat ~/.ssh/authorized_keys"\n'
+        )
+        findings = scan_file(f, "trick.py")
+
+        bb = [fi for fi in findings if fi.pattern_id == "ssh_backdoor"]
+        assert bb and all(fi.severity == "critical" for fi in bb), (
+            "a command-string deny variable must stay critical"
+        )
+        aws = [fi for fi in findings if fi.pattern_id == "aws_dir_access"]
+        assert aws and all(fi.severity == "high" for fi in aws), (
+            "an exec-call deny variable must stay high"
+        )
+
+        # Control: a genuine regex-statement denylist is demoted.
+        g = tmp_path / "ok.py"
+        g.write_text('SKIP = re.compile(r"|authorized_keys")\n')
+        ok_findings = scan_file(g, "ok.py")
+        assert all(
+            fi.severity == "low"
+            for fi in ok_findings
+            if fi.pattern_id in ("ssh_backdoor", "aws_dir_access")
+        )
+
+    def test_deny_container_with_command_stays_flagged(self, tmp_path):
+        # Reviewer finding: a deny-named container whose ELEMENTS are commands
+        # (SKIP = ["base64 ~/.aws/credentials"]) is a real action, not a benign
+        # denylist of paths. A command sequence (verb + space + path) inside the
+        # value must keep full severity.
+        f = tmp_path / "trick2.py"
+        f.write_text(
+            'SKIP = ["base64 ~/.aws/credentials"]\n'
+            'AVOID = {"strings ~/.ssh/authorized_keys"}\n'
+            'IGNORED = ("cp ~/.aws/credentials /tmp/",)\n'
+        )
+        findings = scan_file(f, "trick2.py")
+
+        aws = [fi for fi in findings if fi.pattern_id == "aws_dir_access"]
+        assert aws and all(fi.severity == "high" for fi in aws), (
+            "a container holding a command must stay high"
+        )
+        bb = [fi for fi in findings if fi.pattern_id == "ssh_backdoor"]
+        assert bb and all(fi.severity == "critical" for fi in bb), (
+            "a container holding a command must stay critical"
+        )
+
+    def test_trailing_regex_token_or_semicolon_does_not_demote_action(self, tmp_path):
+        # Reviewer finding: a real action must not be demoted by an `re.compile(`
+        # token appearing later on the line (trailing comment or in-argument),
+        # nor by a `;`-joined command after a deny-regex assignment. The demotion
+        # anchors on the deny-named variable's OWN regex value and requires the
+        # assignment to be the whole statement.
+        f = tmp_path / "trick3.py"
+        f.write_text(
+            'SKIP = shutil.copy("~/.aws/credentials", "/tmp/out")  # re.compile(r"x")\n'
+            'SKIP2 = open("~/.aws/credentials").read()  # re.compile(r"x")\n'
+            'SKIP3 = shutil.copy("~/.aws/credentials", re.compile(r"x"))\n'
+            'SKIP4 = re.compile(r"x"); cat ~/.ssh/authorized_keys\n'
+        )
+        findings = scan_file(f, "trick3.py")
+
+        aws = [fi for fi in findings if fi.pattern_id == "aws_dir_access"]
+        assert aws and all(fi.severity == "high" for fi in aws), (
+            "a real action with a trailing re token must stay high"
+        )
+        bb = [fi for fi in findings if fi.pattern_id == "ssh_backdoor"]
+        assert bb and all(fi.severity == "critical" for fi in bb), (
+            "a ;-joined command after a regex assignment must stay critical"
+        )
+
+    def test_regex_arg_must_be_string_literal_not_expression(self, tmp_path):
+        # Reviewer finding: re.compile(...) evaluates its argument at runtime.
+        # A real action passed as an expression (open().read(), subprocess.run,
+        # shutil.copy) is executed and must NOT be demoted. Only a string-literal
+        # FIRST argument is inert.
+        f = tmp_path / "trick4.py"
+        f.write_text(
+            'SKIP = re.compile(open("~/.aws/credentials").read())\n'
+            'SKIP2 = re.compile(subprocess.run(["cat", "~/.aws/credentials"]))\n'
+            'SKIP3 = re.compile(shutil.copy("~/.aws/credentials", "/tmp/out"))\n'
+        )
+        findings = scan_file(f, "trick4.py")
+
+        aws = [fi for fi in findings if fi.pattern_id == "aws_dir_access"]
+        assert aws and all(fi.severity == "high" for fi in aws), (
+            "a runtime-expression regex argument must stay high"
+        )
+
+        # Control: a string-literal regex denylist is demoted.
+        g = tmp_path / "ok.py"
+        g.write_text('SKIP = re.compile(r"|authorized_keys")\nSKIP2 = re.compile("x", re.I)\n')
+        ok = scan_file(g, "ok.py")
+        assert all(
+            fi.severity == "low"
+            for fi in ok
+            if fi.pattern_id in ("ssh_backdoor", "aws_dir_access")
+        )
+
+    def test_fstring_regex_arg_stays_flagged(self, tmp_path):
+        # Reviewer finding: re.compile(f"{os.system(...)} ...") is an f-string —
+        # it executes the embedded expression at runtime. A path token inside an
+        # f-string argument is a real action and must NOT be demoted.
+        f = tmp_path / "trick5.py"
+        f.write_text(
+            'SKIP = re.compile(f"{os.system(chr(99)+chr(97)+chr(116))} ~/.aws/credentials")\n'
+        )
+        findings = scan_file(f, "trick5.py")
+
+        aws = [fi for fi in findings if fi.pattern_id == "aws_dir_access"]
+        assert aws and all(fi.severity == "high" for fi in aws), (
+            "an f-string regex argument must stay high"
+        )
+
+    def test_runtime_call_in_second_regex_arg_stays_flagged(self, tmp_path):
+        # Reviewer finding: re.compile evaluates ALL its arguments at runtime, so
+        # a real action in the SECOND argument (re.compile("x", os.system(...)))
+        # executes. Only plain identifiers/flags may follow the string literal;
+        # any call parens mean the value is not inert.
+        f = tmp_path / "trick6.py"
+        f.write_text(
+            'SKIP = re.compile("x", __import__("os").system("cat ~/.aws/credentials"))\n'
+            'SKIP2 = re.compile("x", open("~/.aws/credentials").read())\n'
+        )
+        findings = scan_file(f, "trick6.py")
+
+        aws = [fi for fi in findings if fi.pattern_id == "aws_dir_access"]
+        assert aws and all(fi.severity == "high" for fi in aws), (
+            "a runtime call in a later regex argument must stay high"
+        )
+
+        # Control: flags are inert.
+        g = tmp_path / "ok2.py"
+        g.write_text('SKIP = re.compile("authorized_keys", re.IGNORECASE)\n')
+        ok = scan_file(g, "ok2.py")
+        assert all(
+            fi.severity == "low"
+            for fi in ok
+            if fi.pattern_id in ("ssh_backdoor", "aws_dir_access")
+        )
+
 
 # ---------------------------------------------------------------------------
 # .skillignore / .clawhubignore support
