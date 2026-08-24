@@ -9,6 +9,12 @@ metadata:
   hermes:
     tags: [planning, plan-mode, implementation, workflow, design, documentation]
     related_skills: [subagent-driven-development, test-driven-development, requesting-code-review]
+    # Suggested reasoning effort while this skill is active: planning is
+    # reasoning-heavy, so bump thinking depth by default. This is a SUGGESTION
+    # only — a user can override or disable it per-skill via
+    # `agent.reasoning_by_skill` in config (or the dashboard picker). The
+    # effort auto-drops back to the user's normal level once planning ends.
+    reasoning: xhigh
 ---
 
 # Plan Mode
