@@ -2727,6 +2727,13 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
     plugin_keys = _get_plugin_toolset_keys()
     configurable_keys |= plugin_keys
 
+    # Only persist configurable toolsets. Non-configurable, check_fn-gated
+    # toolsets (e.g. `kanban`) are auto-injected by _get_platform_tools() on
+    # every read, so writing them here would silently pollute the user's
+    # explicit config. Filtering them out keeps platform_toolsets clean without
+    # disabling anything.
+    enabled_toolset_keys = enabled_toolset_keys & configurable_keys
+
     # Also exclude platform default toolsets (hermes-cli, hermes-telegram, etc.)
     # These are "super" toolsets that resolve to ALL tools, so preserving them
     # would silently override the user's unchecked selections on the next read.

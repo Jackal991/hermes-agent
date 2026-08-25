@@ -183,6 +183,36 @@ def test_save_platform_tools_preserves_mcp_server_names():
     assert "terminal" not in saved_toolsets
 
 
+def test_apply_toolset_change_does_not_persist_check_fn_gated_toolsets():
+    """#95100: `hermes tools enable/disable` must not write check_fn-gated,
+    non-configurable toolsets (e.g. `kanban`) into the user's explicit
+    platform_toolsets.<platform> config.
+
+    _get_platform_tools() re-injects those gated toolsets on every read, so
+    _save_platform_tools() must filter them out of the persisted set — otherwise
+    a `hermes tools disable homeassistant` silently adds `kanban` (and drops
+    other non-configurable keys) from the user's config even though they never
+    toggled it.
+    """
+    config = {
+        "platform_toolsets": {
+            # Explicit user config: kanban is NOT listed (default — it is not a
+            # configurable/checkbox toolset).
+            "cli": ["web", "memory", "homeassistant"],
+        }
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        # Disabling `homeassistant` must not pull `kanban` into the config even
+        # though _get_platform_tools() includes it in the resolved enabled set.
+        _apply_toolset_change(config, "cli", ["homeassistant"], "disable")
+
+    saved = config["platform_toolsets"]["cli"]
+    assert "homeassistant" not in saved
+    # The bug: the check_fn-gated toolset leaked into the persisted config.
+    assert "kanban" not in saved
+
+
 
 
 
