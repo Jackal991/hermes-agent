@@ -8,6 +8,13 @@ import time
 from types import SimpleNamespace
 
 from agent import relay_runtime
+from agent.session_turn_lease_status import (
+    SESSION_TURN_LEASE_RELOADING_STATUS,
+    SESSION_TURN_LEASE_TIMEOUT_STATUS,
+    SESSION_TURN_LEASE_WAITING_STATUS,
+    is_session_turn_lease_interim_status,
+    session_turn_lease_waiting_again_status,
+)
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -86,7 +93,8 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
         db.events.append(("acquire", session_id, holder))
         on_wait = kwargs.get("on_wait")
         if on_wait is not None:
-            on_wait(0.0)
+            for elapsed in (0.0, 15.0, 30.0):
+                on_wait(elapsed)
         return True
 
     db.acquire_session_turn_lease = acquire_with_wait
@@ -113,17 +121,18 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
         "repair_alternation": True,
         "include_row_ids": True,
     }
-    assert any(
-        kind == "lifecycle"
-        and text
-        and "waiting for it to finish" in text
-        for kind, text in status_events
-    )
-    assert any(
-        kind == "lifecycle"
-        and text
-        and "loading the latest transcript" in text
-        for kind, text in status_events
+    expected_transient_statuses = [
+        SESSION_TURN_LEASE_WAITING_STATUS,
+        session_turn_lease_waiting_again_status(15),
+        session_turn_lease_waiting_again_status(30),
+        SESSION_TURN_LEASE_RELOADING_STATUS,
+    ]
+    assert status_events == [
+        ("lifecycle", message) for message in expected_transient_statuses
+    ]
+    assert all(
+        is_session_turn_lease_interim_status(message)
+        for _kind, message in status_events
     )
 
 
@@ -217,17 +226,14 @@ def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):
     assert result["failed"] is True
     assert result["completed"] is False
     assert "session_turn_lease_timeout:" in result["error"]
-    assert "send it again" in result["final_response"]
+    assert result["final_response"] == SESSION_TURN_LEASE_TIMEOUT_STATUS
     assert [event[0] for event in db.events] == ["acquire"]
-    assert any(
-        kind == "lifecycle"
-        and text
-        and "waiting for it to finish" in text
-        for kind, text in status_events
-    )
-    assert any(
-        kind == "warn" and text and "send it again" in text
-        for kind, text in status_events
+    assert status_events == [
+        ("lifecycle", SESSION_TURN_LEASE_WAITING_STATUS),
+        ("warn", SESSION_TURN_LEASE_TIMEOUT_STATUS),
+    ]
+    assert not is_session_turn_lease_interim_status(
+        SESSION_TURN_LEASE_TIMEOUT_STATUS
     )
 
 

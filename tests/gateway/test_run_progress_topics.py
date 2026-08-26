@@ -815,6 +815,24 @@ class CommentaryAgent:
         }
 
 
+class LeaseWaitStatusAgent:
+    """Emit a status callback after TurnRunner wires the gateway callback."""
+
+    def __init__(self, **_kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        from agent.session_turn_lease_status import SESSION_TURN_LEASE_WAITING_STATUS
+
+        self.status_callback("lifecycle", SESSION_TURN_LEASE_WAITING_STATUS)
+        time.sleep(0.05)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -1181,6 +1199,28 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert result.get("already_sent") is not True
     assert adapter.edits == []
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_interim_mute_reaches_status_callback_send_gate(monkeypatch, tmp_path):
+    """Resolved WhatsApp config suppresses a lease status before any send."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        LeaseWaitStatusAgent,
+        session_id="sess-whatsapp-lease-status-muted",
+        platform=Platform.WHATSAPP,
+        config_data={
+            "display": {
+                "platforms": {
+                    "whatsapp": {"interim_assistant_messages": False}
+                }
+            }
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
 
 
 class TransformedStreamAgent:

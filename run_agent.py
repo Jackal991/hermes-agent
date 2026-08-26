@@ -153,6 +153,12 @@ from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
 from agent.message_content import flatten_message_text
 from agent.session_activity import ActivityProvenance
+from agent.session_turn_lease_status import (
+    SESSION_TURN_LEASE_RELOADING_STATUS,
+    SESSION_TURN_LEASE_TIMEOUT_STATUS,
+    SESSION_TURN_LEASE_WAITING_STATUS,
+    session_turn_lease_waiting_again_status,
+)
 from agent.model_metadata import (
     estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
     is_local_endpoint,
@@ -8643,14 +8649,10 @@ class AIAgent:
                     nonlocal _lease_waited
                     _lease_waited = True
                     if elapsed < 1.0:
-                        self._emit_status(
-                            "⏳ Another Hermes process is using this session; "
-                            "waiting for it to finish before starting your turn..."
-                        )
+                        self._emit_status(SESSION_TURN_LEASE_WAITING_STATUS)
                     else:
                         self._emit_status(
-                            "⏳ Still waiting for the other Hermes process on "
-                            f"this session ({int(elapsed)}s)..."
+                            session_turn_lease_waiting_again_status(int(elapsed))
                         )
 
                 if not _turn_db.acquire_session_turn_lease(
@@ -8697,11 +8699,7 @@ class AIAgent:
                     # Fail closed like gateway TurnLeaseTimeoutError: do not
                     # enter load/run/flush, and surface a resend notice instead
                     # of a bare TimeoutError that looks like a hang.
-                    timeout_msg = (
-                        "⏳ Another Hermes process kept this session busy too "
-                        "long. Your message was not processed - wait for the "
-                        "other process to finish, then send it again."
-                    )
+                    timeout_msg = SESSION_TURN_LEASE_TIMEOUT_STATUS
                     logger.error(
                         "session turn lease wait timed out for %s",
                         session_id,
@@ -8731,9 +8729,7 @@ class AIAgent:
                 self._active_session_turn_lease_holder = _durable_holder
                 self._active_session_turn_lease_ttl_seconds = _lease_ttl
                 if _lease_waited:
-                    self._emit_status(
-                        "Session is free; loading the latest transcript..."
-                    )
+                    self._emit_status(SESSION_TURN_LEASE_RELOADING_STATUS)
 
                 # The holder may have compressed and rotated the session while
                 # this process waited. Resolve and reload only AFTER admission;
