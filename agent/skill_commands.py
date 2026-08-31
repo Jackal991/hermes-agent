@@ -10,7 +10,7 @@ import os
 import re
 import threading
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from hermes_constants import display_hermes_home
 from agent.prompt_cache_boundary import register_stable_prefix
@@ -842,6 +842,7 @@ def build_stacked_skill_invocation_message(
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,
+    force: Iterable[str] = (),
 ) -> tuple[str, list[str], list[str]]:
     """Load one or more skills for session-wide CLI/TUI preloading.
 
@@ -853,6 +854,15 @@ def build_preloaded_skills_prompt(
     bundle-invocation gate (#59156). Without this, ``hermes -s <skill>`` or
     a deployment's ``HERMES_TUI_SKILLS`` env var could force-load a skill an
     operator disabled via ``skills.disabled``/``skills.platform_disabled``.
+
+    ``force`` names (and the internal ``HERMES_FORCE_SKILLS`` env var, a
+    comma-separated list) are provenance-aware exceptions to that gate: the
+    engine uses them to load its own machinery (e.g. the kanban review
+    dispatcher force-loading ``sdlc-review``) even when an operator disabled
+    the skill. Forced names still must exist/load — only the disabled-as-missing
+    check is bypassed, so a user-supplied name can never force-load a skill an
+    operator turned off (#59156 stays exactly as strict for every caller that
+    does not opt in).
     """
     prompt_parts: list[str] = []
     loaded_names: list[str] = []
@@ -863,6 +873,13 @@ def build_preloaded_skills_prompt(
         disabled_names = get_disabled_skill_names()
     except Exception:
         disabled_names = set()
+
+    force_names: set[str] = set(force or ())
+    env_force = os.environ.get("HERMES_FORCE_SKILLS", "")
+    if env_force:
+        force_names.update(
+            name.strip() for name in env_force.split(",") if name.strip()
+        )
 
     seen: set[str] = set()
     for raw_identifier in skill_identifiers:
@@ -878,7 +895,11 @@ def build_preloaded_skills_prompt(
 
         loaded_skill, skill_dir, skill_name = loaded
 
-        if skill_name in disabled_names or identifier in disabled_names:
+        if (
+            skill_name not in force_names
+            and identifier not in force_names
+            and (skill_name in disabled_names or identifier in disabled_names)
+        ):
             missing.append(identifier)
             continue
 

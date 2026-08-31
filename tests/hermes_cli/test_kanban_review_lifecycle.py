@@ -21,6 +21,7 @@ down:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -525,6 +526,58 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
 
     assert task_id in [task[0] for task in result.spawned]
     assert captured == [["domain-specific-review", "sdlc-review"]]
+
+
+def test_review_dispatch_sets_force_skills_env_for_worker(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review dispatch sets HERMES_FORCE_SKILLS=sdlc-review in the worker env
+    (the dispatcher→worker bridge) so the worker's preload path loads the
+    review skill even when the assignee profile disabled it (#99251)."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod,
+        "load_config",
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+    )
+    captured: list[dict] = []
+
+    def spawn(task, workspace):
+        captured.append(
+            {
+                "skills": list(task.skills or []),
+                "force": os.environ.get("HERMES_FORCE_SKILLS"),
+            }
+        )
+        return None
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="domain review",
+            assignee="reviewer",
+            skills=["domain-specific-review"],
+        )
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+        monkeypatch.setattr(kb, "check_respawn_guard", lambda _conn, _task_id, **_kw: None)
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+
+    assert task_id in [task[0] for task in result.spawned]
+    assert captured == [
+        {"skills": ["domain-specific-review", "sdlc-review"], "force": "sdlc-review"}
+    ]
+    # The bridge must not leak to subsequent non-review spawns in this process.
+    assert "HERMES_FORCE_SKILLS" not in os.environ
 
 
 def test_review_dispatch_honors_global_and_per_profile_caps(

@@ -10387,6 +10387,33 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        # Best-effort: if the assignee profile has sdlc-review disabled, say so
+        # loudly — we are about to force-load it anyway because
+        # kanban.review_dispatch is on. A config-read failure must never break
+        # dispatch, so this is fully wrapped.
+        try:
+            from hermes_cli.profiles import resolve_profile_env
+            from agent.skill_utils import yaml_load as _yaml_load
+            _assignee_home = resolve_profile_env(claimed.assignee)
+            _cfg_path = Path(_assignee_home) / "config.yaml"
+            if _cfg_path.exists():
+                _parsed = _yaml_load(_cfg_path.read_text(encoding="utf-8"))
+                _skills_cfg = _parsed.get("skills") if isinstance(_parsed, dict) else None
+                _disabled = set()
+                if isinstance(_skills_cfg, dict):
+                    _raw = _skills_cfg.get("disabled")
+                    if isinstance(_raw, list):
+                        _disabled = {str(x).strip() for x in _raw if str(x).strip()}
+                    elif isinstance(_raw, str):
+                        _disabled = {x.strip() for x in _raw.split(",") if x.strip()}
+                if "sdlc-review" in _disabled:
+                    _log.warning(
+                        "review dispatch: assignee profile %s has sdlc-review "
+                        "disabled; forcing it anyway because kanban.review_dispatch is on",
+                        claimed.assignee,
+                    )
+        except Exception:
+            pass  # Best-effort warning only; never break dispatch.
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
         # kanban lifecycle is already injected into every worker's system
@@ -10396,6 +10423,11 @@ def _dispatch_once_locked(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        # Internal dispatcher→worker bridge: tell the spawned worker that
+        # sdlc-review is engine-forced, so its preload path loads it even if
+        # the assignee profile disabled it. Cleared in ``finally`` so it never
+        # leaks to subsequent non-review spawns in this process.
+        os.environ["HERMES_FORCE_SKILLS"] = "sdlc-review"
         try:
             import inspect
             try:
@@ -10426,6 +10458,8 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+        finally:
+            os.environ.pop("HERMES_FORCE_SKILLS", None)
     return result
 
 

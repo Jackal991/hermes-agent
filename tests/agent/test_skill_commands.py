@@ -562,6 +562,46 @@ class TestBuildPreloadedSkillsPrompt:
         assert "SECRET DISABLED CONTENT." not in prompt
         assert "enabled-skill" in prompt
 
+    def test_force_loads_disabled_skill(self, tmp_path, monkeypatch):
+        """A disabled skill named in ``force`` (or HERMES_FORCE_SKILLS) is
+        loaded rather than treated as missing — the provenance-aware exception
+        the kanban review dispatcher uses to force-load sdlc-review even when
+        an operator disabled it (#99251)."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "sdlc-review", body="REVIEW LOGIC.")
+
+            import agent.skill_utils as su_module
+            monkeypatch.setattr(
+                su_module, "get_disabled_skill_names", lambda platform=None: {"sdlc-review"}
+            )
+
+            prompt, loaded, missing = build_preloaded_skills_prompt(
+                ["sdlc-review"], force=["sdlc-review"]
+            )
+
+        assert loaded == ["sdlc-review"]
+        assert missing == []
+        assert "REVIEW LOGIC." in prompt
+
+    def test_force_env_var_loads_disabled_skill(self, tmp_path, monkeypatch):
+        """HERMES_FORCE_SKILLS (the dispatcher→worker bridge) also bypasses the
+        disabled-as-missing gate, so every preload caller gets the behavior
+        without a code change at each call site (#99251)."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "sdlc-review", body="REVIEW LOGIC.")
+
+            import agent.skill_utils as su_module
+            monkeypatch.setattr(
+                su_module, "get_disabled_skill_names", lambda platform=None: {"sdlc-review"}
+            )
+            monkeypatch.setenv("HERMES_FORCE_SKILLS", "sdlc-review")
+
+            prompt, loaded, missing = build_preloaded_skills_prompt(["sdlc-review"])
+
+        assert loaded == ["sdlc-review"]
+        assert missing == []
+        assert "REVIEW LOGIC." in prompt
+
 
 
 class TestBuildSkillInvocationMessage:
